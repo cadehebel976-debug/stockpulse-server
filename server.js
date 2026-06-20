@@ -1,6 +1,9 @@
 const express = require("express");
 const cors = require("cors");
 const fetch = require("node-fetch");
+const fs = require("fs");
+const path = require("path");
+const crypto = require("crypto");
 
 const app = express();
 app.use(cors());
@@ -9,13 +12,89 @@ app.use(express.json());
 const PORT = process.env.PORT || 3000;
 const ANTHROPIC_KEY = process.env.ANTHROPIC_KEY || "";
 const FINNHUB_KEY = process.env.FINNHUB_KEY || "";
+const USERS_FILE = path.join("/tmp", "sp_users.json");
 
-// Health check
+// ─── User storage helpers ────────────────────────────────────────
+function loadUsers() {
+  try { return JSON.parse(fs.readFileSync(USERS_FILE, "utf8")); } catch(e) { return {}; }
+}
+function saveUsers(users) {
+  fs.writeFileSync(USERS_FILE, JSON.stringify(users, null, 2));
+}
+function hashPassword(pw) {
+  return crypto.createHash("sha256").update(pw + "sp_salt_2026").digest("hex");
+}
+function generateToken() {
+  return crypto.randomBytes(32).toString("hex");
+}
+
+// ─── Auth endpoints ──────────────────────────────────────────────
+app.post("/api/signup", (req, res) => {
+  const { name, email, password } = req.body;
+  if (!name || !email || !password) return res.status(400).json({ error: "Missing fields" });
+  const users = loadUsers();
+  const emailLower = email.toLowerCase().trim();
+  if (Object.values(users).find(u => u.email === emailLower)) {
+    return res.status(400).json({ error: "Email already registered" });
+  }
+  const token = generateToken();
+  const userId = "u_" + Date.now();
+  users[userId] = {
+    name: name.trim(),
+    email: emailLower,
+    password: hashPassword(password),
+    token,
+    createdAt: new Date().toISOString(),
+    data: { stocks: [], alerts: {}, portfolio: {}, frequency: "daily" }
+  };
+  saveUsers(users);
+  res.json({ token, name: name.trim(), userId });
+});
+
+app.post("/api/login", (req, res) => {
+  const { email, password } = req.body;
+  if (!email || !password) return res.status(400).json({ error: "Missing fields" });
+  const users = loadUsers();
+  const emailLower = email.toLowerCase().trim();
+  const entry = Object.entries(users).find(([,u]) => u.email === emailLower);
+  if (!entry) return res.status(401).json({ error: "No account found with that email" });
+  const [userId, user] = entry;
+  if (user.password !== hashPassword(password)) return res.status(401).json({ error: "Wrong password" });
+  // Regenerate token on each login
+  const token = generateToken();
+  users[userId].token = token;
+  saveUsers(users);
+  res.json({ token, name: user.name, userId, data: user.data });
+});
+
+app.post("/api/verify", (req, res) => {
+  const { token } = req.body;
+  if (!token) return res.status(401).json({ error: "No token" });
+  const users = loadUsers();
+  const entry = Object.entries(users).find(([,u]) => u.token === token);
+  if (!entry) return res.status(401).json({ error: "Invalid token" });
+  const [userId, user] = entry;
+  res.json({ valid: true, name: user.name, userId, data: user.data });
+});
+
+app.post("/api/save", (req, res) => {
+  const { token, data } = req.body;
+  if (!token) return res.status(401).json({ error: "No token" });
+  const users = loadUsers();
+  const entry = Object.entries(users).find(([,u]) => u.token === token);
+  if (!entry) return res.status(401).json({ error: "Invalid token" });
+  const [userId] = entry;
+  users[userId].data = data;
+  saveUsers(users);
+  res.json({ ok: true });
+});
+
+// ─── Health check ────────────────────────────────────────────────
 app.get("/", (req, res) => {
   res.json({ status: "StockPulse server running", time: new Date().toISOString() });
 });
 
-// Live price (with intraday closes for sparklines)
+// ─── Live price ──────────────────────────────────────────────────
 app.get("/api/price/:ticker", async (req, res) => {
   const { ticker } = req.params;
   for (const host of ["query1", "query2"]) {
@@ -30,16 +109,9 @@ app.get("/api/price/:ticker", async (req, res) => {
                     meta.regularMarketPrice;
       const prev = meta.chartPreviousClose || meta.previousClose || price;
       const closes = data?.chart?.result?.[0]?.indicators?.quote?.[0]?.close || [];
-      return res.json({
-        price, prev,
-        chg: prev ? ((price - prev) / prev * 100) : 0,
-        closes: closes.filter(x => x !== null && x > 0),
-        isAH: meta.postMarketPrice > 0,
-        isPM: meta.preMarketPrice > 0
-      });
+      return res.json({ price, prev, chg: prev?((price-prev)/prev*100):0, closes: closes.filter(x=>x!==null&&x>0), isAH: meta.postMarketPrice>0, isPM: meta.preMarketPrice>0 });
     } catch(e) {}
   }
-  // Finnhub fallback
   if (FINNHUB_KEY) {
     try {
       const fd = await fetch(`https://finnhub.io/api/v1/quote?symbol=${ticker}&token=${FINNHUB_KEY}`).then(r=>r.json());
@@ -49,7 +121,7 @@ app.get("/api/price/:ticker", async (req, res) => {
   res.status(500).json({ error: "Price unavailable" });
 });
 
-// Intraday sparkline (5m interval)
+// ─── Intraday sparkline ──────────────────────────────────────────
 app.get("/api/intraday/:ticker", async (req, res) => {
   const { ticker } = req.params;
   for (const host of ["query1", "query2"]) {
@@ -63,17 +135,13 @@ app.get("/api/intraday/:ticker", async (req, res) => {
       const price = meta.regularMarketPrice;
       const prev = meta.chartPreviousClose || meta.previousClose || price;
       const closes = result.indicators?.quote?.[0]?.close || [];
-      return res.json({
-        price, prev,
-        chg: prev ? ((price - prev) / prev * 100) : 0,
-        closes: closes.filter(x => x !== null && x > 0)
-      });
+      return res.json({ price, prev, chg: prev?((price-prev)/prev*100):0, closes: closes.filter(x=>x!==null&&x>0) });
     } catch(e) {}
   }
   res.status(500).json({ error: "Unavailable" });
 });
 
-// Historical chart (30-day, for portfolio charts)
+// ─── Historical chart ────────────────────────────────────────────
 app.get("/api/chart/:ticker", async (req, res) => {
   const { ticker } = req.params;
   const range = req.query.range || "1mo";
@@ -87,20 +155,13 @@ app.get("/api/chart/:ticker", async (req, res) => {
       if (!result) continue;
       const meta = result.meta;
       const closes = result.indicators?.quote?.[0]?.close || [];
-      return res.json({
-        ticker,
-        price: meta.regularMarketPrice,
-        prev: meta.chartPreviousClose || meta.previousClose,
-        hi52: meta.fiftyTwoWeekHigh,
-        lo52: meta.fiftyTwoWeekLow,
-        closes: closes.filter(x => x !== null && x > 0)
-      });
+      return res.json({ ticker, price: meta.regularMarketPrice, prev: meta.chartPreviousClose||meta.previousClose, hi52: meta.fiftyTwoWeekHigh, lo52: meta.fiftyTwoWeekLow, closes: closes.filter(x=>x!==null&&x>0) });
     } catch(e) {}
   }
   res.status(500).json({ error: "Chart unavailable" });
 });
 
-// Macro data (VIX, 10Y yield, Oil)
+// ─── Macro data ──────────────────────────────────────────────────
 app.get("/api/macro", async (req, res) => {
   const tickers = { vix: "%5EVIX", yield: "%5ETNX", oil: "CL%3DF" };
   const results = {};
@@ -116,7 +177,7 @@ app.get("/api/macro", async (req, res) => {
   res.json(results);
 });
 
-// Sector data
+// ─── Sectors ────────────────────────────────────────────────────
 app.get("/api/sectors", async (req, res) => {
   const sectors = { Technology:"XLK", Energy:"XLE", Healthcare:"XLV", Financials:"XLF", Consumer:"XLY", Industrials:"XLI" };
   const results = [];
@@ -131,9 +192,7 @@ app.get("/api/sectors", async (req, res) => {
       const data = await r.json();
       const meta = data?.chart?.result?.[0]?.meta;
       if (meta?.regularMarketPrice && (meta.chartPreviousClose||meta.previousClose)) {
-        const p = meta.regularMarketPrice;
-        const pc = meta.chartPreviousClose || meta.previousClose;
-        results.push({ name, chg: (p-pc)/pc*100 });
+        results.push({ name, chg: (meta.regularMarketPrice-(meta.chartPreviousClose||meta.previousClose))/(meta.chartPreviousClose||meta.previousClose)*100 });
       }
     } catch(e) {}
   }));
@@ -141,39 +200,30 @@ app.get("/api/sectors", async (req, res) => {
   res.json(results);
 });
 
-// Finnhub news
+// ─── News ────────────────────────────────────────────────────────
 app.get("/api/news/:ticker", async (req, res) => {
   const { ticker } = req.params;
   if (!FINNHUB_KEY) return res.status(400).json({ error: "No Finnhub key" });
   try {
     const to = new Date().toISOString().split("T")[0];
-    const from = new Date(Date.now() - 7*24*60*60*1000).toISOString().split("T")[0];
-    const url = `https://finnhub.io/api/v1/company-news?symbol=${ticker}&from=${from}&to=${to}&token=${FINNHUB_KEY}`;
-    const data = await fetch(url).then(r=>r.json());
-    res.json(data.slice(0, 5).map(n => ({ headline: n.headline, url: n.url, source: n.source })));
-  } catch(e) {
-    res.status(500).json({ error: e.message });
-  }
+    const from = new Date(Date.now()-7*24*60*60*1000).toISOString().split("T")[0];
+    const data = await fetch(`https://finnhub.io/api/v1/company-news?symbol=${ticker}&from=${from}&to=${to}&token=${FINNHUB_KEY}`).then(r=>r.json());
+    res.json(data.slice(0,5).map(n=>({ headline: n.headline, url: n.url, source: n.source })));
+  } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-// Anthropic API proxy
+// ─── Anthropic API proxy ─────────────────────────────────────────
 app.post("/api/brief", async (req, res) => {
-  if (!ANTHROPIC_KEY) return res.status(400).json({ error: "No Anthropic key configured" });
+  if (!ANTHROPIC_KEY) return res.status(400).json({ error: "No Anthropic key" });
   const { messages, max_tokens } = req.body;
   try {
     const r = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-api-key": ANTHROPIC_KEY,
-        "anthropic-version": "2023-06-01"
-      },
+      headers: { "Content-Type": "application/json", "x-api-key": ANTHROPIC_KEY, "anthropic-version": "2023-06-01" },
       body: JSON.stringify({ model: "claude-sonnet-4-6", max_tokens: max_tokens || 3000, messages })
     });
     res.json(await r.json());
-  } catch(e) {
-    res.status(500).json({ error: e.message });
-  }
+  } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
 app.listen(PORT, () => console.log(`StockPulse server running on port ${PORT}`));
