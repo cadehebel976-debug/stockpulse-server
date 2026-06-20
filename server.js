@@ -226,4 +226,25 @@ app.post("/api/brief", async (req, res) => {
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-app.listen(PORT, () => console.log(`StockPulse server running on port ${PORT}`));
+// Earnings
+app.get('/api/earnings/:ticker', async (req, res) => {
+  try {
+    const r = await fetch(`https://finnhub.io/api/v1/calendar/earnings?symbol=${req.params.ticker}&token=${FINNHUB_KEY}`);
+    const d = await r.json();
+    const upcoming = (d.earningsCalendar || []).find(e => new Date(e.date) >= new Date());
+    if (upcoming) res.json({ date: upcoming.date, epsEstimate: upcoming.epsEstimate, hour: upcoming.hour });
+    else res.json({});
+  } catch(e) { res.json({}); }
+});
+
+// Analyst ratings
+app.get('/api/analyst/:ticker', async (req, res) => {
+  try {
+    const [rec, pt] = await Promise.all([
+      fetch(`https://finnhub.io/api/v1/stock/recommendation?symbol=${req.params.ticker}&token=${FINNHUB_KEY}`).then(r => r.json()),
+      fetch(`https://finnhub.io/api/v1/stock/price-target?symbol=${req.params.ticker}&token=${FINNHUB_KEY}`).then(r => r.json())
+    ]);
+    const latest = rec && rec[0] ? rec[0] : {};
+    res.json({ buy: latest.buy, hold: latest.hold, sell: latest.sell, strongBuy: latest.strongBuy, strongSell: latest.strongSell, targetPrice: pt.targetMean });
+  } catch(e) { res.json({}); }
+});app.listen(PORT, () => console.log(`StockPulse server running on port ${PORT}`));
