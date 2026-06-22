@@ -158,6 +158,19 @@ app.get("/api/chart/:ticker", async (req, res) => {
       if (closes.length >= 5) return res.json({ ticker, closes, hi52, lo52 });
     } catch(e) {}
   }
+  // Finnhub fallback
+  try {
+    const to = Math.floor(Date.now() / 1000);
+    const from = to - (35 * 24 * 60 * 60);
+    const [candle, metric] = await Promise.all([
+      fetch(`https://finnhub.io/api/v1/stock/candle?symbol=${ticker}&resolution=D&from=${from}&to=${to}&token=${FINNHUB_KEY}`).then(r=>r.json()),
+      fetch(`https://finnhub.io/api/v1/stock/metric?symbol=${ticker}&metric=all&token=${FINNHUB_KEY}`).then(r=>r.json())
+    ]);
+    if (candle && candle.s !== 'no_data' && candle.c?.length >= 5) {
+      const m = metric.metric || {};
+      return res.json({ ticker, closes: candle.c, hi52: m['52WeekHigh'], lo52: m['52WeekLow'] });
+    }
+  } catch(e) {}
   res.status(500).json({ error: "Chart unavailable" });
 });
 
