@@ -257,10 +257,10 @@ app.post("/api/brief", async (req, res) => {
 // ─── Earnings ────────────────────────────────────────────────────
 app.get("/api/earnings/:ticker", async (req, res) => {
   try {
-    const r = await fetch(`https://finnhub.io/api/v1/stock/earnings?symbol=${req.params.ticker}&limit=4&token=${FINNHUB_KEY}`);
+    const r = await fetch(`https://finnhub.io/api/v1/calendar/earnings?symbol=${req.params.ticker}&token=${FINNHUB_KEY}`);
     const d = await r.json();
-    const next = (d || []).find(e => new Date(e.period) >= new Date());
-    if (next) res.json({ date: next.period, epsEstimate: next.estimate, hour: "" });
+    const upcoming = (d.earningsCalendar || []).find(e => new Date(e.date) >= new Date());
+    if (upcoming) res.json({ date: upcoming.date, epsEstimate: upcoming.epsEstimate, hour: upcoming.hour });
     else res.json({});
   } catch(e) { res.json({}); }
 });
