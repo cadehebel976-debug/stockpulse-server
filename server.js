@@ -1,9 +1,8 @@
 const express = require("express");
 const cors = require("cors");
 const fetch = require("node-fetch");
-const fs = require("fs");
-const path = require("path");
 const crypto = require("crypto");
+const { Pool } = require("pg");
 
 const app = express();
 app.use(cors());
@@ -12,15 +11,30 @@ app.use(express.json());
 const PORT = process.env.PORT || 3000;
 const ANTHROPIC_KEY = process.env.ANTHROPIC_KEY || "";
 const FINNHUB_KEY = process.env.FINNHUB_KEY || "";
-const USERS_FILE = path.join("/tmp", "sp_users.json");
 
-// ─── User storage helpers ────────────────────────────────────────
-function loadUsers() {
-  try { return JSON.parse(fs.readFileSync(USERS_FILE, "utf8")); } catch(e) { return {}; }
+// ─── Postgres setup ──────────────────────────────────────────────
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false }
+});
+
+async function initDB() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS users (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      email TEXT UNIQUE NOT NULL,
+      password TEXT NOT NULL,
+      token TEXT,
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      data JSONB DEFAULT '{}'
+    )
+  `);
+  console.log("DB ready");
 }
-function saveUsers(users) {
-  fs.writeFileSync(USERS_FILE, JSON.stringify(users, null, 2));
-}
+initDB().catch(console.error);
+
+// ─── Helpers ─────────────────────────────────────────────────────
 function hashPassword(pw) {
   return crypto.createHash("sha256").update(pw + "sp_salt_2026").digest("hex");
 }
@@ -29,64 +43,65 @@ function generateToken() {
 }
 
 // ─── Auth endpoints ──────────────────────────────────────────────
-app.post("/api/signup", (req, res) => {
+app.post("/api/signup", async (req, res) => {
   const { name, email, password } = req.body;
   if (!name || !email || !password) return res.status(400).json({ error: "Missing fields" });
-  const users = loadUsers();
-  const emailLower = email.toLowerCase().trim();
-  if (Object.values(users).find(u => u.email === emailLower)) {
-    return res.status(400).json({ error: "Email already registered" });
+  try {
+    const emailLower = email.toLowerCase().trim();
+    const token = generateToken();
+    const userId = "u_" + Date.now();
+    const defaultData = { stocks: [], alerts: {}, portfolio: {}, frequency: "daily" };
+    await pool.query(
+      `INSERT INTO users (id, name, email, password, token, data) VALUES ($1,$2,$3,$4,$5,$6)`,
+      [userId, name.trim(), emailLower, hashPassword(password), token, JSON.stringify(defaultData)]
+    );
+    res.json({ token, name: name.trim(), userId });
+  } catch(e) {
+    if (e.code === "23505") return res.status(400).json({ error: "Email already registered" });
+    res.status(500).json({ error: e.message });
   }
-  const token = generateToken();
-  const userId = "u_" + Date.now();
-  users[userId] = {
-    name: name.trim(),
-    email: emailLower,
-    password: hashPassword(password),
-    token,
-    createdAt: new Date().toISOString(),
-    data: { stocks: [], alerts: {}, portfolio: {}, frequency: "daily" }
-  };
-  saveUsers(users);
-  res.json({ token, name: name.trim(), userId });
 });
 
-app.post("/api/login", (req, res) => {
+app.post("/api/login", async (req, res) => {
   const { email, password } = req.body;
   if (!email || !password) return res.status(400).json({ error: "Missing fields" });
-  const users = loadUsers();
-  const emailLower = email.toLowerCase().trim();
-  const entry = Object.entries(users).find(([,u]) => u.email === emailLower);
-  if (!entry) return res.status(401).json({ error: "No account found with that email" });
-  const [userId, user] = entry;
-  if (user.password !== hashPassword(password)) return res.status(401).json({ error: "Wrong password" });
-  // Regenerate token on each login
-  const token = generateToken();
-  users[userId].token = token;
-  saveUsers(users);
-  res.json({ token, name: user.name, userId, data: user.data });
+  try {
+    const emailLower = email.toLowerCase().trim();
+    const result = await pool.query(`SELECT * FROM users WHERE email = $1`, [emailLower]);
+    if (!result.rows.length) return res.status(401).json({ error: "No account found with that email" });
+    const user = result.rows[0];
+    if (user.password !== hashPassword(password)) return res.status(401).json({ error: "Wrong password" });
+    const token = generateToken();
+    await pool.query(`UPDATE users SET token = $1 WHERE id = $2`, [token, user.id]);
+    res.json({ token, name: user.name, userId: user.id, data: user.data });
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
-app.post("/api/verify", (req, res) => {
+app.post("/api/verify", async (req, res) => {
   const { token } = req.body;
   if (!token) return res.status(401).json({ error: "No token" });
-  const users = loadUsers();
-  const entry = Object.entries(users).find(([,u]) => u.token === token);
-  if (!entry) return res.status(401).json({ error: "Invalid token" });
-  const [userId, user] = entry;
-  res.json({ valid: true, name: user.name, userId, data: user.data });
+  try {
+    const result = await pool.query(`SELECT * FROM users WHERE token = $1`, [token]);
+    if (!result.rows.length) return res.status(401).json({ error: "Invalid token" });
+    const user = result.rows[0];
+    res.json({ valid: true, name: user.name, userId: user.id, data: user.data });
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
-app.post("/api/save", (req, res) => {
+app.post("/api/save", async (req, res) => {
   const { token, data } = req.body;
   if (!token) return res.status(401).json({ error: "No token" });
-  const users = loadUsers();
-  const entry = Object.entries(users).find(([,u]) => u.token === token);
-  if (!entry) return res.status(401).json({ error: "Invalid token" });
-  const [userId] = entry;
-  users[userId].data = data;
-  saveUsers(users);
-  res.json({ ok: true });
+  try {
+    const result = await pool.query(`UPDATE users SET data = $1 WHERE token = $2 RETURNING id`, [JSON.stringify(data), token]);
+    if (!result.rows.length) return res.status(401).json({ error: "Invalid token" });
+    res.json({ ok: true });
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // ─── Health check ────────────────────────────────────────────────
@@ -166,9 +181,9 @@ app.get("/api/chart/:ticker", async (req, res) => {
       fetch(`https://finnhub.io/api/v1/stock/candle?symbol=${ticker}&resolution=D&from=${from}&to=${to}&token=${FINNHUB_KEY}`).then(r=>r.json()),
       fetch(`https://finnhub.io/api/v1/stock/metric?symbol=${ticker}&metric=all&token=${FINNHUB_KEY}`).then(r=>r.json())
     ]);
-    if (candle && candle.s !== 'no_data' && candle.c?.length >= 5) {
+    if (candle && candle.s !== "no_data" && candle.c?.length >= 5) {
       const m = metric.metric || {};
-      return res.json({ ticker, closes: candle.c, hi52: m['52WeekHigh'], lo52: m['52WeekLow'] });
+      return res.json({ ticker, closes: candle.c, hi52: m["52WeekHigh"], lo52: m["52WeekLow"] });
     }
   } catch(e) {}
   res.status(500).json({ error: "Chart unavailable" });
@@ -190,7 +205,7 @@ app.get("/api/macro", async (req, res) => {
   res.json(results);
 });
 
-// ─── Sectors ────────────────────────────────────────────────────
+// ─── Sectors ─────────────────────────────────────────────────────
 app.get("/api/sectors", async (req, res) => {
   const sectors = { Technology:"XLK", Energy:"XLE", Healthcare:"XLV", Financials:"XLF", Consumer:"XLY", Industrials:"XLI" };
   const results = [];
@@ -213,7 +228,7 @@ app.get("/api/sectors", async (req, res) => {
   res.json(results);
 });
 
-// ─── News ────────────────────────────────────────────────────────
+// ─── News ─────────────────────────────────────────────────────────
 app.get("/api/news/:ticker", async (req, res) => {
   const { ticker } = req.params;
   if (!FINNHUB_KEY) return res.status(400).json({ error: "No Finnhub key" });
@@ -225,7 +240,7 @@ app.get("/api/news/:ticker", async (req, res) => {
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-// ─── Anthropic API proxy ─────────────────────────────────────────
+// ─── Anthropic API proxy ──────────────────────────────────────────
 app.post("/api/brief", async (req, res) => {
   if (!ANTHROPIC_KEY) return res.status(400).json({ error: "No Anthropic key" });
   const { messages, max_tokens } = req.body;
@@ -239,25 +254,27 @@ app.post("/api/brief", async (req, res) => {
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-// Earnings
-app.get('/api/earnings/:ticker', async (req, res) => {
+// ─── Earnings ────────────────────────────────────────────────────
+app.get("/api/earnings/:ticker", async (req, res) => {
   try {
     const r = await fetch(`https://finnhub.io/api/v1/stock/earnings?symbol=${req.params.ticker}&limit=4&token=${FINNHUB_KEY}`);
     const d = await r.json();
     const next = (d || []).find(e => new Date(e.period) >= new Date());
-    if (next) res.json({ date: next.period, epsEstimate: next.estimate, hour: '' });
+    if (next) res.json({ date: next.period, epsEstimate: next.estimate, hour: "" });
     else res.json({});
   } catch(e) { res.json({}); }
 });
 
-// Analyst ratings
-app.get('/api/analyst/:ticker', async (req, res) => {
+// ─── Analyst ratings ─────────────────────────────────────────────
+app.get("/api/analyst/:ticker", async (req, res) => {
   try {
     const [rec, pt] = await Promise.all([
-      fetch(`https://finnhub.io/api/v1/stock/recommendation?symbol=${req.params.ticker}&token=${FINNHUB_KEY}`).then(r => r.json()),
-      fetch(`https://finnhub.io/api/v1/stock/price-target?symbol=${req.params.ticker}&token=${FINNHUB_KEY}`).then(r => r.json())
+      fetch(`https://finnhub.io/api/v1/stock/recommendation?symbol=${req.params.ticker}&token=${FINNHUB_KEY}`).then(r=>r.json()),
+      fetch(`https://finnhub.io/api/v1/stock/price-target?symbol=${req.params.ticker}&token=${FINNHUB_KEY}`).then(r=>r.json())
     ]);
     const latest = rec && rec[0] ? rec[0] : {};
     res.json({ buy: latest.buy, hold: latest.hold, sell: latest.sell, strongBuy: latest.strongBuy, strongSell: latest.strongSell, targetPrice: pt.targetMean });
   } catch(e) { res.json({}); }
-});app.listen(PORT, () => console.log(`StockPulse server running on port ${PORT}`));
+});
+
+app.listen(PORT, () => console.log(`StockPulse server running on port ${PORT}`));
