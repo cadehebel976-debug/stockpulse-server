@@ -257,10 +257,15 @@ app.post("/api/brief", async (req, res) => {
 // ─── Earnings ────────────────────────────────────────────────────
 app.get("/api/earnings/:ticker", async (req, res) => {
   try {
-    const r = await fetch(`https://finnhub.io/api/v1/calendar/earnings?symbol=${req.params.ticker}&token=${FINNHUB_KEY}`);
-    const d = await r.json();
-    const upcoming = (d.earningsCalendar || []).find(e => new Date(e.date) >= new Date());
-    if (upcoming) res.json({ date: upcoming.date, epsEstimate: upcoming.epsEstimate, hour: upcoming.hour });
+    const AV_KEY = process.env.ALPHA_VANTAGE_KEY || "";
+    const r = await fetch(`https://www.alphavantage.co/query?function=EARNINGS_CALENDAR&symbol=${req.params.ticker}&horizon=3month&apikey=${AV_KEY}`);
+    const text = await r.text();
+    const lines = text.trim().split("\n").slice(1); // skip header
+    const upcoming = lines.map(l => {
+      const cols = l.split(",");
+      return { symbol: cols[0], date: cols[2], epsEstimate: cols[4] };
+    }).find(e => e.date && new Date(e.date) >= new Date());
+    if (upcoming) res.json({ date: upcoming.date, epsEstimate: upcoming.epsEstimate, hour: "" });
     else res.json({});
   } catch(e) { res.json({}); }
 });
