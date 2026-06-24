@@ -175,21 +175,6 @@ app.get("/api/chart/:ticker", async (req, res) => {
     res.status(500).json({ error: "Chart unavailable" });
   }
 });
-  // Finnhub fallback
-  try {
-    const to = Math.floor(Date.now() / 1000);
-    const from = to - (35 * 24 * 60 * 60);
-    const [candle, metric] = await Promise.all([
-      fetch(`https://finnhub.io/api/v1/stock/candle?symbol=${ticker}&resolution=D&from=${from}&to=${to}&token=${FINNHUB_KEY}`).then(r=>r.json()),
-      fetch(`https://finnhub.io/api/v1/stock/metric?symbol=${ticker}&metric=all&token=${FINNHUB_KEY}`).then(r=>r.json())
-    ]);
-    if (candle && candle.s !== "no_data" && candle.c?.length >= 5) {
-      const m = metric.metric || {};
-      return res.json({ ticker, closes: candle.c, hi52: m["52WeekHigh"], lo52: m["52WeekLow"] });
-    }
-  } catch(e) {}
-  res.status(500).json({ error: "Chart unavailable" });
-});
 
 // ─── Macro data ──────────────────────────────────────────────────
 app.get("/api/macro", async (req, res) => {
@@ -259,15 +244,10 @@ app.post("/api/brief", async (req, res) => {
 // ─── Earnings ────────────────────────────────────────────────────
 app.get("/api/earnings/:ticker", async (req, res) => {
   try {
-    const AV_KEY = process.env.ALPHA_VANTAGE_KEY || "";
-    const r = await fetch(`https://www.alphavantage.co/query?function=EARNINGS_CALENDAR&symbol=${req.params.ticker}&horizon=3month&apikey=${AV_KEY}`);
-    const text = await r.text();
-    const lines = text.trim().split("\n").slice(1); // skip header
-    const upcoming = lines.map(l => {
-      const cols = l.split(",");
-      return { symbol: cols[0], date: cols[2], epsEstimate: cols[4] };
-    }).find(e => e.date && new Date(e.date) >= new Date());
-    if (upcoming) res.json({ date: upcoming.date, epsEstimate: upcoming.epsEstimate, hour: "" });
+    const r = await fetch(`https://finnhub.io/api/v1/stock/earnings?symbol=${req.params.ticker}&limit=4&token=${FINNHUB_KEY}`);
+    const d = await r.json();
+    const next = (d || []).find(e => new Date(e.period) >= new Date());
+    if (next) res.json({ date: next.period, epsEstimate: next.estimate, hour: "" });
     else res.json({});
   } catch(e) { res.json({}); }
 });
