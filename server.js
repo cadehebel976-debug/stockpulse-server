@@ -159,20 +159,22 @@ app.get("/api/intraday/:ticker", async (req, res) => {
 // ─── Historical chart ────────────────────────────────────────────
 app.get("/api/chart/:ticker", async (req, res) => {
   const { ticker } = req.params;
-  for (const host of ["query1", "query2"]) {
-    try {
-      const url = `https://${host}.finance.yahoo.com/v8/finance/chart/${ticker}?interval=1d&range=1mo`;
-      const r = await fetch(url, { headers: { "User-Agent": "Mozilla/5.0" } });
-      const data = await r.json();
-      const result = data?.chart?.result?.[0];
-      if (!result) continue;
-      const closes = result.indicators?.quote?.[0]?.close || [];
-      const meta = result.meta;
-      const hi52 = meta?.fiftyTwoWeekHigh;
-      const lo52 = meta?.fiftyTwoWeekLow;
-      if (closes.length >= 5) return res.json({ ticker, closes, hi52, lo52 });
-    } catch(e) {}
+  try {
+    const to = Math.floor(Date.now() / 1000);
+    const from = to - (35 * 24 * 60 * 60);
+    const [candle, metric] = await Promise.all([
+      fetch(`https://finnhub.io/api/v1/stock/candle?symbol=${ticker}&resolution=D&from=${from}&to=${to}&token=${FINNHUB_KEY}`).then(r=>r.json()),
+      fetch(`https://finnhub.io/api/v1/stock/metric?symbol=${ticker}&metric=all&token=${FINNHUB_KEY}`).then(r=>r.json())
+    ]);
+    if (candle && candle.s !== "no_data" && candle.c?.length >= 5) {
+      const m = metric.metric || {};
+      return res.json({ ticker, closes: candle.c, hi52: m["52WeekHigh"], lo52: m["52WeekLow"] });
+    }
+    res.status(500).json({ error: "Chart unavailable" });
+  } catch(e) {
+    res.status(500).json({ error: "Chart unavailable" });
   }
+});
   // Finnhub fallback
   try {
     const to = Math.floor(Date.now() / 1000);
